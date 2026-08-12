@@ -214,6 +214,204 @@ class ModelmvBayes(AbstractModel):
         return out
 
 
+class ModelmvBayesBinned(AbstractModel):
+    """
+    Dynamic-bin wrapper around mvBayesBinned for pooled calibration.
+
+    The sampler may move across bins. At each proposed input, prediction is made
+    using the corresponding bin-specific emulator component. Likelihood is then
+    evaluated against the observed response associated with that same bin.
+
+    Bin-specific observed responses are expected to be attached externally as
+    self.yobs_by_bin, e.g. via CalibSetup.addVecExperimentsBinned(...).
+    """
+
+    def __init__(self, bmod, input_names, exp_ind=None, s2="MH", psi=False):
+        self.mod = bmod
+        self.psi = psi
+        self.stochastic = True
+        self.nmcmc = self.mod.nSamples
+        self.input_names = input_names
+
+        self.meas_error_cor = None
+        self.discrep_cov = None
+
+        self.ii = 0
+        self.yobs = None
+        self.yobs_by_bin = None
+        self.marg_lik_cov = None
+        self.discrep_vars = None
+        self.nd = 0
+        self.discrep_tau = 1.0
+        self.D = None
+        self.discrep = 0.0
+
+        if exp_ind is None:
+            exp_ind = np.array(0)
+        self.nexp = np.asarray(exp_ind).max() + 1
+        self.exp_ind = exp_ind
+        self.s2 = s2
+        self.constants = None
+
+        if s2 == "gibbs":
+            raise ValueError("Cannot use Gibbs s2 for emulator models.")
+
+        # Cache per-bin quantities needed for likelihood construction
+        self.bin_basis = {}
+        self.bin_trunc_error_cov = {}
+        self.bin_mod_s2 = {}
+        for binKey, component in self.mod.modelDict.items():
+            binKey = self._normalizeBinKey(binKey)
+
+            basis = component.basisInfo.basis.T
+            self.bin_basis[binKey] = basis
+            self.bin_trunc_error_cov[binKey] = np.cov(component.basisInfo.truncError.T)
+
+            npc = component.basisInfo.nBasis
+            mod_s2 = np.empty((self.nmcmc, npc))
+            for k in range(npc):
+                mod_s2[:, k] = component.bmList[k].samples.residSD[: self.nmcmc] ** 2
+            self.bin_mod_s2[binKey] = mod_s2
+
+        self.emu_vars_by_bin = {
+            self._normalizeBinKey(binKey): self.bin_mod_s2[self._normalizeBinKey(binKey)][self.ii]
+            for binKey in self.mod.binKeys
+        }
+
+        # Cached from most recent pooled eval
+        self.last_bin_tuples_pool = None
+
+    def _normalizeBinKey(self, binKey):
+        """
+        Convert array-like bin keys to a hashable tuple of ints.
+        """
+        if isinstance(binKey, np.ndarray):
+            return tuple(int(x) for x in binKey.tolist())
+        elif isinstance(binKey, list):
+            return tuple(int(x) for x in binKey)
+        elif isinstance(binKey, tuple):
+            return tuple(int(x) for x in binKey)
+        else:
+            try:
+                return tuple(int(x) for x in binKey)
+            except TypeError:
+                raise ValueError(f"Could not normalize bin key: {binKey}")
+
+    def step(self):
+        self.ii = np.random.choice(range(self.nmcmc), 1).item()
+        self.emu_vars_by_bin = {
+            self._normalizeBinKey(binKey): self.bin_mod_s2[self._normalizeBinKey(binKey)][self.ii]
+            for binKey in self.mod.binKeys
+        }
+
+    def discrep_sample(self, yobs, pred, cov, itemp):
+        S = np.linalg.inv(
+            np.eye(self.nd) / self.discrep_tau + self.D.T @ cov["inv"] @ self.D
+        )
+        m = self.D.T @ cov["inv"] @ (yobs - pred)
+        discrep_vars = chol_sample(S @ m, S / itemp)
+        return discrep_vars
+
+    def eval(self, parmat, pool=None, nugget=False):
+        parmat_array = np.vstack([parmat[v] for v in self.input_names]).T
+
+        pred, bin_tuples = self.mod.predict(
+            parmat_array,
+            idxSamples=np.array([self.ii]),
+            returnBinTuple=True,
+        )
+        pred = pred[0, :, :]
+
+        if pool is True:
+            self.last_bin_tuples_pool = [
+                self._normalizeBinKey(bt) for bt in bin_tuples
+            ]
+            return pred
+        else:
+            nrep = next(iter(parmat.values())).shape[0] // self.nexp
+            return np.concatenate(
+                [
+                    pred[
+                        np.ix_(
+                            np.arange(i, nrep * self.nexp, self.nexp),
+                            np.where(self.exp_ind == i)[0],
+                        )
+                    ]
+                    for i in range(self.nexp)
+                ],
+                1,
+            )
+
+    def llik(self, yobs, pred, cov):
+        vec = yobs - pred
+        out = -0.5 * (cov["ldet"] + vec.T @ cov["inv"] @ vec)
+        return out
+
+    def lik_cov_inv(self, s2vec):
+        """
+        Fallback only if exactly one cached bin is present.
+        """
+        if self.last_bin_tuples_pool is None:
+            raise ValueError(
+                "lik_cov_inv was called before eval(pool=True), so no cached bin "
+                "assignments are available."
+            )
+
+        unique_bins = list(dict.fromkeys(self.last_bin_tuples_pool))
+        if len(unique_bins) != 1:
+            raise ValueError(
+                "Multiple bins are present in the cached pooled evaluation. "
+                "Use lik_cov_inv_for_bin(s2vec, binKey) instead."
+            )
+
+        return self.lik_cov_inv_for_bin(s2vec, unique_bins[0])
+
+    def lik_cov_inv_for_bin(self, s2vec, binKey):
+        binKey = self._normalizeBinKey(binKey)
+
+        basis = self.bin_basis[binKey]
+        trunc_error_cov = self.bin_trunc_error_cov[binKey]
+        emu_vars = self.emu_vars_by_bin[binKey]
+
+        n = len(s2vec)
+        if self.meas_error_cor is None:
+            meas_error_cor = np.eye(n)
+        else:
+            meas_error_cor = self.meas_error_cor[:n, :n]
+
+        if self.discrep_cov is None:
+            discrep_cov = np.eye(n) * 1e-12
+        else:
+            discrep_cov = self.discrep_cov
+
+        Sigma = cor2cov(meas_error_cor, np.sqrt(s2vec))
+        mat = (
+            Sigma
+            + trunc_error_cov
+            + discrep_cov
+            + basis @ np.diag(emu_vars) @ basis.T
+        )
+
+        chol = cholesky(mat)
+        ldet = 2 * np.sum(np.log(np.diag(chol)))
+        inv = np.linalg.inv(mat)
+        out = {"inv": inv, "ldet": ldet}
+        return out
+
+    def get_yobs_for_bin(self, binKey):
+        binKey = self._normalizeBinKey(binKey)
+
+        if self.yobs_by_bin is None:
+            raise ValueError(
+                "Bin-specific observed responses are not attached. "
+                "Use CalibSetup.addVecExperimentsBinned(...)."
+            )
+
+        if binKey not in self.yobs_by_bin:
+            raise ValueError(f"No observed response found for bin {binKey}.")
+        return self.yobs_by_bin[binKey]
+
+
 class ModelmvBayes_mf(AbstractModel):
     """
     ModelmvBayes_mf: mvBayes Emulator for Functional Outputs using multi-
