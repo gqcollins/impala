@@ -1,12 +1,15 @@
+####################################
+"""Impala postprocessing and plotting scripts"""
+
+####################################
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.stats as ss
 import seaborn as sns
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from scipy.interpolate import interp1d
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, rankdata
 
 from impala import superCal as sc
 
@@ -58,7 +61,6 @@ def func_prediction_plot(
     if ylim is not None:
         plt.ylim(ylim)
     if text is not None:
-        # plt.text(*text_coords, text)
         plt.text(0.1, 0.85, text, transform=plt.gca().transAxes)
     if pdf:
         pdf.savefig(fig)
@@ -274,6 +276,7 @@ def ptw_prediction_plots_hier(
 def ptw_prediction_plots_cluster(
     setup, calib_out, path, mcmc_use, ylim=None, alpha=0.05
 ):
+    """PTW Prediction Plots"""
     pred_theta_raw = [
         np.empty([mcmc_use.shape[0], setup.ys[i].shape[0]])
         for i in range(setup.nexp)
@@ -288,7 +291,6 @@ def ptw_prediction_plots_cluster(
     ]
 
     thetas = calib_out.theta[mcmc_use, 0]
-    [calib_out.delta[i][mcmc_use] for i in range(setup.nexp)]
     nclustmax = max(calib_out.out.delta[i].max() for i in range(setup.nexp)) + 1
     dcounts = np.zeros((mcmc_use.shape[0], nclustmax))
     for it, s in enumerate(mcmc_use):
@@ -432,7 +434,7 @@ def kde_contour(x1, x2, percentile):
 def pairwise_theta_plot_hier(
     setup, calib_out, path, mcmc_use, alpha=0.05, highlight=None
 ):
-    """Pairwise Theta scatterplot"""
+    """Pairwise Theta scatterplot; specialized version for hierarchical calibration results."""
     lty = ["solid", "dotted", "dashed", "dashdot"]
     if highlight is None:
         highlight = [range(setup.ntheta[k]) for k in range(setup.nexp)]
@@ -552,7 +554,7 @@ def pairwise_theta_plot_hier(
 
 
 def pairwise_theta_plot_pool(setup, calib_out, path, mcmc_use, alpha=0.05):
-    """Pairwise Theta scatterplot"""
+    """Pairwise Theta scatterplot; specialized version for pooled calibration results."""
     theta_names = list(setup.bounds.keys())
     theta0_unst = sc.unnormalize(
         calib_out.theta[mcmc_use, 0, :], setup.bounds_mat
@@ -563,7 +565,6 @@ def pairwise_theta_plot_pool(setup, calib_out, path, mcmc_use, alpha=0.05):
             if i == j:
                 plt.subplot2grid((setup.p, setup.p), (i, j))
                 sns.kdeplot(theta0_unst[:, i], color="blue")
-                # plt.xlim(0,1)
                 plt.xlim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
                 ax = plt.gca()
                 ax.axes.yaxis.set_visible(False)
@@ -586,8 +587,6 @@ def pairwise_theta_plot_pool(setup, calib_out, path, mcmc_use, alpha=0.05):
                     contour["conts"],
                     colors="blue",
                 )
-                # plt.xlim(0,1)
-                # plt.ylim(0,1)
                 plt.xlim(setup.bounds_mat[j, 0], setup.bounds_mat[j, 1])
                 plt.ylim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
                 ax = plt.gca()
@@ -621,7 +620,6 @@ def pairwise_theta_plot_pool_compare(
                 plt.subplot2grid((setup.p, setup.p), (i, j))
                 for k in range(n):
                     sns.kdeplot(theta0_unst_list[k][:, i], color=cols[k])
-                # plt.xlim(0,1)
                 plt.xlim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
                 ax = plt.gca()
                 ax.axes.yaxis.set_visible(False)
@@ -646,8 +644,6 @@ def pairwise_theta_plot_pool_compare(
                         contour_list[k]["conts"],
                         colors=cols[k],
                     )
-                # plt.xlim(0,1)
-                # plt.ylim(0,1)
                 plt.xlim(setup.bounds_mat[j, 0], setup.bounds_mat[j, 1])
                 plt.ylim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
                 ax = plt.gca()
@@ -667,8 +663,8 @@ def pairwise_theta_plot_pool_compare(
 def pairwise_theta_plot_cluster(
     setup, calib_out, path, mcmc_use, alpha=0.05, highlight=None
 ):
+    """Pairwise Theta scatterplot; specialized version for clustered calibration results."""
     thetas = calib_out.theta[mcmc_use, 0]
-    [calib_out.delta[i][mcmc_use] for i in range(setup.nexp)]
     nclustmax = max(calib_out.delta[i].max() for i in range(setup.nexp)) + 1
     dcounts = np.zeros((mcmc_use.shape[0], nclustmax))
     for it, s in enumerate(mcmc_use):
@@ -709,7 +705,6 @@ def pairwise_theta_plot_cluster(
             if i == j:
                 plt.subplot2grid((setup.p, setup.p), (i, j))
                 for k in range(setup.nexp):
-                    # for s in range(self.setup.ntheta[k]):
                     if highlight[k] is not None:
                         for s in highlight[k]:
                             sns.kdeplot(
@@ -717,7 +712,6 @@ def pairwise_theta_plot_cluster(
                             )
                 sns.kdeplot(theta0_unst[:, i], color="blue")
                 sns.kdeplot(theta_parent_unst[:, i], color="grey")
-                # plt.xlim(0,1)
 
                 plt.xlim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
 
@@ -734,7 +728,6 @@ def pairwise_theta_plot_cluster(
                 plt.subplot2grid((setup.p, setup.p), (i, j))
                 cnt = 0
                 for k in range(setup.nexp):
-                    # for s in range(self.setup.ntheta[k]):
                     if highlight[k] is not None:
                         for s in highlight[k]:
                             cnt += 1
@@ -772,8 +765,6 @@ def pairwise_theta_plot_cluster(
                     contour["conts"],
                     colors="grey",
                 )
-                # plt.xlim(0,1)
-                # plt.ylim(0,1)
 
                 plt.xlim(setup.bounds_mat[j, 0], setup.bounds_mat[j, 1])
                 plt.ylim(setup.bounds_mat[i, 0], setup.bounds_mat[i, 1])
@@ -806,8 +797,6 @@ def cluster_matrix(delta_list, ns2, nclustmax, nburn=20000, nthin=10):
     # subset delta to post burn-in
     delta_relist = [d[nburn::nthin] for d in delta_list]
     # Declare constants
-    delta_relist[0].shape[0]
-    len(delta_relist)
     # create a combined delta array (for all experiments/vectorized experiments)
     # Boolean array, so (True iff member of cluster)
     breaks = np.hstack((0, np.cumsum(ns2)))
@@ -832,9 +821,9 @@ def cluster_matrix_plot(setup, calib_out, path=None, **kwargs):
     )
     plt.matshow(cmat)
     if breaks.shape[0] > 1:
-        for breakpoint in breaks[1:-1] - 0.5:
-            plt.axhline(breakpoint, color="red", linestyle="--")
-            plt.axvline(breakpoint, color="green", linestyle="--")
+        for breakpnt in breaks[1:-1] - 0.5:
+            plt.axhline(breakpnt, color="red", linestyle="--")
+            plt.axvline(breakpnt, color="green", linestyle="--")
     plt.legend()
     if path:
         plt.savefig(path, bbox_inches="tight")
@@ -847,6 +836,9 @@ def hide_current_axis(*args, **kwds):
 
 
 def pairs(setup, mat_st, col=None, s=None, path=None):
+    """
+    Generates a standard pairwise scatterplot showing parameter draws for pairs of parameters.
+    """
     dat = pd.DataFrame(
         sc.tran_unif(mat_st, setup.bounds_mat, setup.bounds.keys())
     )
@@ -869,27 +861,54 @@ def pairs(setup, mat_st, col=None, s=None, path=None):
     #    plt.show()
 
 
-def parameter_trace_plot(sample_parameters, ylim=None):
+def parameter_trace_plot(
+    sample_parameters, ylim=None, parameter_names=None, figsize=None
+):
+    """
+    Generates a stack of trace plots showing the posterior draws for the
+    calibration parameters (y-axis) as a function of the number of iterations
+    of the MCMC sampler (x-axis).
+    An optional list of 'parameter_names' may be passed to label the y-axis
+    of each plot (one per calibration parameter).
+    """
+    if isinstance(sample_parameters, pd.DataFrame):
+        if parameter_names is None:
+            parameter_names = list(sample_parameters.columns)
+        sample_parameters = sample_parameters.to_numpy()
+
+    n, d = sample_parameters.shape
+    fig_h = max(2.0, 1.0 * d)
+    if figsize is None:
+        figsize = (8, fig_h)
+    fig, axes = plt.subplots(d, 1, figsize=figsize, sharex=True)
     palette = plt.get_cmap("Set1")
-    if len(sample_parameters.shape) == 1:
-        n = sample_parameters.shape[0]
-        plt.plot(range(n), sample_parameters, marker="", linewidth=1)
-    else:
-        # df = pd.DataFrame(sample_parameters, self.parameter_order)
-        n, d = sample_parameters.shape
-        for i in range(d):
-            plt.subplot(d, 1, i + 1)
-            plt.plot(
-                range(n),
-                sample_parameters[:, i],
-                marker="",
-                color=palette(i),
-                linewidth=1,
+    if d == 1:
+        axes = [axes]
+
+    if parameter_names is None:
+        parameter_names = [""] * d
+    for i, ax in enumerate(axes):
+        ax.plot(
+            range(n), sample_parameters[:, i], color=palette(i), linewidth=1.0
+        )
+
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        if parameter_names[i] != "":
+            ax.set_ylabel(
+                parameter_names[i],
+                fontsize=10,
+                rotation=0,
+                labelpad=20,
+                ha="right",
+                va="center",
             )
-            ax = plt.gca()
-            if ylim is not None:
-                ax.set_ylim(ylim)
+        ax.set_yticks([0.0, 0.5, 1.0])
+
+    axes[-1].set_xlabel("Iteration")
+    fig.subplots_adjust(left=0.12, hspace=0.35)
     #    plt.show()
+    # return fig, axes
 
 
 def parameter_trace_plot_rollmean(sample_parameters, ylim=None, num_draws=100):
@@ -979,6 +998,7 @@ def total_temperature_swaps(out, setup):
 
 
 def save_parent_strength(setup, ptw_mod, calib_out, mcmc_use, path):
+    """writes the parent distribution to file 'path'."""
     theta_parent = sc.chol_sample_1per_constraints(
         calib_out.theta0[mcmc_use, 0],
         calib_out.Sigma0[mcmc_use, 0],
@@ -1024,10 +1044,12 @@ def save_parent_strength(setup, ptw_mod, calib_out, mcmc_use, path):
 
 
 def get_bounds(edot, strain, temp, results_csv, write_path, percentiles=None):
-    # rank parent distribution samples by stress at particular strain, strain rate, temperature, save to file
+    """
+    Function to get bounds;
+    rank parent distribution samples by stress at particular strain, strain rate, temperature, save to file
+    """
     if percentiles is None:
         percentiles = [0.05, 0.5, 0.95]
-    edot * 1e-6  # first term is per second
 
     df = pd.read_csv(results_csv, nrows=1, header=None)
     mods = df.loc[0, :].values.tolist()
@@ -1077,9 +1099,10 @@ def get_bounds(edot, strain, temp, results_csv, write_path, percentiles=None):
 
 
 def get_samples_rank(edot, strain, temp, results_csv, write_path):
-    # rank parent distribution samples by stress at particular strain, strain rate, temperature, save all samples to file, for sky
-    edot * 1e-6  # first term is per second
-
+    """
+    rank parent distribution samples by stress at particular strain, strain rate, temperature, save all samples to file
+    (first term is per second)
+    """
     df = pd.read_csv(results_csv, nrows=1, header=None)
     mods = df.loc[0, :].values.tolist()
 
@@ -1105,7 +1128,7 @@ def get_samples_rank(edot, strain, temp, results_csv, write_path):
     stress_star = model_ptw_star.eval(theta_parent_native)[:, -1]
     ranked_post = pd.DataFrame(theta_parent_native)
     ranked_post["stress"] = stress_star
-    ranked_post["rank"] = ss.rankdata(stress_star)  # append
+    ranked_post["rank"] = rankdata(stress_star)  # append
 
     template = (
         "edot(1/s)="
@@ -1122,6 +1145,9 @@ def get_samples_rank(edot, strain, temp, results_csv, write_path):
 
 
 def get_best_sse(results_csv, write_path):
+    """
+    Function to get the best parameters (uses sum of squared error, sse).
+    """
     df = pd.read_csv(results_csv, skiprows=7)
     theta_parent_native = dict(zip(df.T.index, df.values.T))
     rank_sse = np.argsort(theta_parent_native["sse"])
