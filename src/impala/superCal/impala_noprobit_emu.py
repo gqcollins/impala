@@ -8,36 +8,28 @@
 ### Imports ###
 ###############
 
-import time
-from collections import namedtuple
-from math import floor, log, sqrt
-from multiprocessing import Pool
+from collections import defaultdict
+from math import floor, log
 
 import numpy as np
-import scipy
 from numpy.linalg import cholesky, slogdet
-from numpy.random import normal, uniform
+from numpy.random import normal
+from scipy import stats as sps
 from scipy.special import erf, erfinv, gammaln, multigammaln
-from scipy.stats import invwishart
 
 from ..physics import PTW_goodparam
 
-# from itertools import repeat
-# import multiprocessing as mp
-# import pandas as pd
-from .pbar import pbar
-
 np.seterr(under="ignore")
-
-# no probit tranform for hierarchical and DP versions
 
 ###############################################################
 ### CalibSetup Class for Initializing the Calibration Model ###
 ###############################################################
-from collections import defaultdict
 
 
 def is_valid_mapping(theta_inds, s2_inds):
+    """
+    Verify that there aren't multiple thetas with shared measurement error.
+    """
     error_to_x = defaultdict(set)
 
     for x, e in zip(theta_inds, s2_inds):
@@ -46,12 +38,108 @@ def is_valid_mapping(theta_inds, s2_inds):
     return all(len(xs) == 1 for xs in error_to_x.values())
 
 
+#############################################################
+### Priors for the calibration parameters (theta)         ###
+#############################################################
+
+# Log densities for the univariate priors that may be placed on a single
+# calibration parameter.  Parameter names match the corresponding R
+# (rImpala) arguments so that the two interfaces stay in sync.
+THETA_PRIOR_LOGPDF = {
+    "normal": lambda x, pp: sps.norm.logpdf(x, loc=pp["mean"], scale=pp["sd"]),
+    "lognormal": lambda x, pp: sps.lognorm.logpdf(
+        x, s=pp["sdlog"], scale=np.exp(pp["meanlog"])
+    ),
+    "beta": lambda x, pp: sps.beta.logpdf(x, pp["shape1"], pp["shape2"]),
+    "uniform": lambda x, pp: sps.uniform.logpdf(
+        x, loc=pp["min"], scale=pp["max"] - pp["min"]
+    ),
+    "gamma": lambda x, pp: sps.gamma.logpdf(
+        x, pp["shape"], scale=1.0 / pp["rate"]
+    ),
+    "cauchy": lambda x, pp: sps.cauchy.logpdf(
+        x, loc=pp["location"], scale=pp["scale"]
+    ),
+}
+
+# Required entries of the `params` dict for each supported distribution.
+THETA_PRIOR_PARAMS = {
+    "normal": ("mean", "sd"),
+    "lognormal": ("meanlog", "sdlog"),
+    "beta": ("shape1", "shape2"),
+    "uniform": ("min", "max"),
+    "gamma": ("shape", "rate"),
+    "cauchy": ("location", "scale"),
+}
+
+
+def eval_theta_priors(theta, priors, tnames=None):
+    """Evaluate the log prior for the calibration parameters.
+
+    :param theta: dict of native-scale parameter vectors keyed by parameter
+        name (one entry per temperature in each vector), as returned by
+        ``tran_unif``.  A 2d array of shape (ntemps, p) may be passed instead
+        if ``tnames`` is supplied.
+    :param priors: list of prior specifications, i.e. ``setup.theta_prior``.
+        Entries with a ``name`` key are independent priors on a single
+        parameter; entries with a ``names`` key are joint priors evaluated
+        with a user-supplied ``log_density_fn``.
+    :param tnames: optional parameter names, used when ``theta`` is an array.
+    :return: array of length ntemps with the summed log prior.  When no
+        priors have been set this is a vector of zeros, so calibration is
+        unaffected.
+    """
+    if tnames is not None and not isinstance(theta, dict):
+        theta = dict(zip(tnames, np.asarray(theta).T))
+
+    ntemps = np.atleast_1d(next(iter(theta.values()))).shape[0]
+    lp = np.zeros(ntemps)
+    if not priors:
+        return lp
+
+    for p in priors:
+        if p.get("names") is not None:
+            # joint prior: hand the named parameters to the user's function
+            params_list = {nm: np.atleast_1d(theta[nm]) for nm in p["names"]}
+            add = p["log_density_fn"](params_list)
+        else:
+            # independent prior on a single parameter
+            x = np.atleast_1d(theta[p["name"]])
+            try:
+                logpdf = THETA_PRIOR_LOGPDF[p["dist"]]
+            except KeyError:
+                raise ValueError(f"Unsupported dist: {p['dist']}") from None
+            add = logpdf(x, p["params"])
+
+        lp = lp + np.broadcast_to(np.asarray(add, dtype=float), lp.shape)
+
+    # a NaN density (e.g. a proposal outside the support of the prior) is
+    # treated as zero probability rather than propagating into alpha
+    return np.where(np.isnan(lp), -np.inf, lp)
+
+
+def theta_log_prior(setup, theta_mat):
+    """Log prior of a (ntemps, p) matrix of unit-scaled calibration parameters.
+
+    Returns zeros (with no work done) when no prior has been added to
+    ``setup``, so that the samplers behave exactly as they did before.
+    """
+    priors = getattr(setup, "theta_prior", None)
+    if not priors:
+        return np.zeros(np.atleast_2d(theta_mat).shape[0])
+    return eval_theta_priors(
+        tran_unif(theta_mat, setup.bounds_mat, setup.bounds.keys()), priors
+    )
+
+
 class CalibSetup:
     """
     Structure for storing calibration experimental data, likelihood, discrepancy, etc.
     Includes the following methods:
 
     * addVecExperiments
+    * addThetaPrior
+    * addJointThetaPrior
     * setTemperatureLadder
     * setMCMC
     * setHierPriors
@@ -102,6 +190,8 @@ class CalibSetup:
         self.ig_a = []
         self.ig_b = []
         self.wt = []
+        self.sd_lower = []
+        self.sd_upper = []
         self.s2_ind = []
         self.s2_exp_ind = []
         self.ns2 = []
@@ -113,6 +203,117 @@ class CalibSetup:
         self.constants = None
         self.theta0_start = None  # optional
         self.theta_start = None  # optional
+        self.nswap_per = None
+        self.start_temper = None
+        self.start_var_theta = None
+        self.start_tau_theta = None
+        self.start_var_ls2 = None
+        self.start_tau_ls2 = None
+        self.start_adapt_iter = None
+        self.theta0_prior_mean = None
+        self.theta0_prior_cov = None
+        self.Sigma0_prior_df = None
+        self.Sigma0_prior_scale = None
+        self.nclustmax = None
+        self.eta_prior_shape = None
+        self.eta_prior_rate = None
+        self.theta_prior = []  # optional priors for theta, see addThetaPrior
+
+    def addThetaPrior(self, dist="uniform", params=None, pname=None):
+        """Add a prior distribution for a single calibration parameter.
+
+        Without a prior, each calibration parameter is implicitly uniform on
+        the bounds given to :class:`CalibSetup`.  Any parameter left without
+        an explicit prior keeps that behavior.
+
+        :param dist: name of the distribution.  One of 'normal', 'lognormal',
+            'beta', 'uniform', 'gamma', 'cauchy'.
+        :param params: dict of distribution parameters, on the native
+            (unnormalized) scale of the calibration parameter:
+
+            * normal: 'mean', 'sd'
+            * lognormal: 'meanlog', 'sdlog'
+            * beta: 'shape1', 'shape2'
+            * uniform: 'min', 'max'
+            * gamma: 'shape', 'rate'
+            * cauchy: 'location', 'scale'
+
+        :param pname: name of the calibration parameter, i.e. one of the keys
+            of the bounds dict given to :class:`CalibSetup`.
+        :return: the `CalibSetup` object (modified in place, returned so that
+            calls may be chained).
+
+        Note that the prior is truncated to the bounds of the parameter, since
+        proposals outside the bounds are rejected by the constraint function.
+        """
+        if params is None:
+            params = {"min": 0.0, "max": 1.0}
+        if pname is None or pname not in self.bounds:
+            raise ValueError(
+                "No parameter name given, or parameter not in the set of "
+                "input names for any model in setup."
+            )
+        if dist not in THETA_PRIOR_LOGPDF:
+            raise ValueError(
+                f"Unsupported dist: {dist}.  Supported distributions are "
+                f"{sorted(THETA_PRIOR_LOGPDF)}."
+            )
+        missing = [k for k in THETA_PRIOR_PARAMS[dist] if k not in params]
+        if missing:
+            raise ValueError(
+                f"Missing parameters {missing} for dist '{dist}'; expected "
+                f"{list(THETA_PRIOR_PARAMS[dist])}."
+            )
+
+        self.theta_prior.append({
+            "name": pname,
+            "dist": dist,
+            "params": dict(params),
+        })
+        return self
+
+    def addJointThetaPrior(self, pnames, log_density_fn):
+        """Add a joint prior over several calibration parameters.
+
+        :param pnames: list of calibration parameter names the joint prior
+            applies to; each must be a key of the bounds dict given to
+            :class:`CalibSetup`.
+        :param log_density_fn: function taking a dict that maps each name in
+            `pnames` to an array of length ntemps of native-scale parameter
+            values, and returning the log density, either as a scalar or as an
+            array of length ntemps.
+        :return: the `CalibSetup` object (modified in place, returned so that
+            calls may be chained).
+
+        For example, a bivariate normal prior on 't_1' and 't_2'::
+
+            from scipy.stats import multivariate_normal
+
+            def joint_prior(params):
+                x = np.column_stack((params['t_1'], params['t_2']))
+                return multivariate_normal.logpdf(
+                    x, mean=[0, 0], cov=[[1, 0.5], [0.5, 1]]
+                )
+
+            setup.addJointThetaPrior(['t_1', 't_2'], joint_prior)
+        """
+        if isinstance(pnames, str):
+            pnames = [pnames]
+        pnames = list(pnames)
+        invalid = [nm for nm in pnames if nm not in self.bounds]
+        if invalid:
+            raise ValueError(
+                f"Parameter names {invalid} are not in the set of input "
+                "names for any model in setup."
+            )
+        if not callable(log_density_fn):
+            raise TypeError("log_density_fn must be callable")
+
+        self.theta_prior.append({
+            "names": pnames,
+            "log_density_fn": log_density_fn,
+        })
+        return self
 
     def checkConstraints(self, x, *args):
         """Calls the constraint function set by the user. Argument x contains the parameters to be checked
@@ -538,41 +739,55 @@ def subset_dict(dd, idx):
 
 
 def tran_probit(th, bounds, names):
+    """
+    transforms th from 0-1 scale to the native scale according to the bounds
+    """
     return dict(zip(names, unnormalize(invprobit(th), bounds).T))  # If probit
     # return dict(zip(names, unnormalize(th, bounds).T)) # If uniform
 
 
 def tran_unif(th, bounds, names):
+    """
+    transforms th from 0-1 scale to the native scale according to the bounds
+    """
     return dict(zip(names, unnormalize(th, bounds).T))  # If uniform
 
 
 def chol_sample(mean, cov):
+    """generate samples"""
     return mean + np.dot(
         np.linalg.cholesky(cov), np.random.standard_normal(mean.size)
     )
 
 
 def chol_sample_1per(means, covs):
+    """generate samples"""
     return means + np.einsum(
         "tnpq,tnq->tnp", cholesky(covs), normal(size=means.shape)
     )
 
 
 def chol_sample_nper(means, covs, n):
+    """generate samples"""
     return means + np.einsum(
         "ijk,ilk->ilj", cholesky(covs), normal(size=(*means.shape, n))
     )
 
 
 def chol_sample_1per_constraints(
-    means, covs, cf, bounds_mat, bounds_keys, bounds, consts
+    means, covs, cf, bounds_mat, bounds_keys, bounds, consts, maxiter=1000000
 ):
     """Sample with constraints.  If fail constraints, resample."""
     chols = cholesky(covs)
     cand = means + np.einsum("ijk,ik->ij", chols, normal(size=means.shape))
     good = cf(tran_unif(cand, bounds_mat, bounds_keys), bounds, consts)
+    j = 0
     while np.any(np.logical_not(good)):
-        cand[np.where(np.logical_not(good))] = +means[
+        if j >= maxiter:
+            raise ValueError(
+                f"Failed to find samples that fulfill the constraints after {maxiter} iterations."
+            )
+        cand[np.where(np.logical_not(good))] = means[
             np.logical_not(good)
         ] + np.einsum(
             "ijk,ik->ij",
@@ -583,11 +798,12 @@ def chol_sample_1per_constraints(
             tran_unif(cand[np.logical_not(good)], bounds_mat, bounds_keys),
             bounds,
         )
+        j += 1
     return cand
 
 
 def chol_sample_nper_constraints(
-    means, covs, n, cf, bounds_mat, bounds_keys, bounds, consts
+    means, covs, n, cf, bounds_mat, bounds_keys, bounds, consts, maxiter=1000000
 ):
     """Sample with constraints.  If fail constraints, resample."""
     chols = cholesky(covs)
@@ -596,8 +812,13 @@ def chol_sample_nper_constraints(
     )
     for i in range(cand.shape[0]):
         goodi = cf(tran_unif(cand[i], bounds_mat, bounds_keys), bounds, consts)
+        j = 0
         while np.any(np.logical_not(goodi)):
-            cand[i, np.where(np.logical_not(goodi))[0]] = +means[i] + np.einsum(
+            if j >= maxiter:
+                raise ValueError(
+                    f"Failed to find samples that fulfill the constraints after {maxiter} iterations."
+                )
+            cand[i, np.where(np.logical_not(goodi))[0]] = means[i] + np.einsum(
                 "ik,nk->ni",
                 chols[i],
                 normal(size=((np.logical_not(goodi)).sum(), means.shape[1])),
@@ -610,6 +831,7 @@ def chol_sample_nper_constraints(
                 ),
                 bounds,
             )
+            j += 1
     return cand
 
 
