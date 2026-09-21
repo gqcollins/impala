@@ -714,6 +714,486 @@ def calibPool(setup):
     return out
 
 
+def calibPoolBinned(setup):
+    """Perform pooled calibration for one or more mvBayesBinned-style models with bin-specific experiments."""
+    t0 = time.time()
+
+    theta = np.empty([setup.nmcmc, setup.ntemps, setup.p])
+
+    log_s2 = [
+        np.ones([setup.nmcmc, setup.ntemps, setup.ns2[i]])
+        for i in range(setup.nexp)
+    ]
+    for i in range(setup.nexp):
+        log_s2[i][0] = np.log(setup.sd_est[i] ** 2)
+
+    s2_ind_mat = [
+        (setup.s2_ind[i][:, None] == range(setup.ns2[i]))
+        for i in range(setup.nexp)
+    ]
+
+    theta_start0 = initfunc_unif(size=[setup.ntemps, setup.p])
+    good = setup.checkConstraints(
+        tran_unif(theta_start0, setup.bounds_mat, setup.bounds.keys())
+    )
+    while np.any(np.logical_not(good)):
+        theta_start0[np.where(np.logical_not(good))] = initfunc_unif(
+            size=[(np.logical_not(good)).sum(), setup.p]
+        )
+        good[np.where(np.logical_not(good))] = setup.checkConstraints(
+            tran_unif(
+                theta_start0[np.where(np.logical_not(good))],
+                setup.bounds_mat,
+                setup.bounds.keys(),
+            )
+        )
+    theta[0] = theta_start0
+
+    itl_mat = [
+        (np.ones((setup.ns2[i], setup.ntemps)) * setup.itl).T
+        for i in range(setup.nexp)
+    ]
+
+    pred_curr = [None] * setup.nexp
+    llik_curr = np.empty([setup.nexp, setup.ntemps])
+    marg_lik_cov_curr = [None] * setup.nexp
+    yobs_curr = [None] * setup.nexp
+    bin_curr = [None] * setup.nexp
+
+    llik_curr[:] = 0.0
+
+    # Initial prediction / likelihood setup for each model
+    for i in range(setup.nexp):
+        pred_curr[i] = setup.models[i].eval(
+            tran_unif(theta[0], setup.bounds_mat, setup.bounds.keys()),
+            pool=True,
+        )
+        current_bins = np.asarray(setup.models[i].last_bin_tuples_pool, dtype=object)
+        bin_curr[i] = current_bins.copy()
+
+        marg_lik_cov_curr[i] = [None] * setup.ntemps
+        yobs_curr[i] = [None] * setup.ntemps
+        for t in range(setup.ntemps):
+            binKey_t = bin_curr[i][t]
+            yobs_curr[i][t] = setup.models[i].get_yobs_for_bin(binKey_t)
+            s2vec_t = np.exp(log_s2[i][0][t])[setup.s2_ind[i]]
+            marg_lik_cov_curr[i][t] = setup.models[i].lik_cov_inv_for_bin(
+                s2vec_t, binKey_t
+            )
+            llik_curr[i, t] = setup.models[i].llik(
+                yobs_curr[i][t],
+                pred_curr[i][t],
+                marg_lik_cov_curr[i][t],
+            )
+
+    cov_theta_cand = AMcov_pool(
+        ntemps=setup.ntemps,
+        p=setup.p,
+        start_var=setup.start_var_theta,
+        tau_start=setup.start_tau_theta,
+        start_adapt_iter=setup.start_adapt_iter,
+    )
+    cov_ls2_cand = [
+        AMcov_pool(
+            ntemps=setup.ntemps,
+            p=setup.ns2[i],
+            start_var=setup.start_var_ls2,
+            tau_start=setup.start_tau_ls2,
+            start_adapt_iter=setup.start_adapt_iter,
+        )
+        for i in range(setup.nexp)
+    ]
+
+    count = np.zeros([setup.ntemps, setup.ntemps], dtype=int)
+    count_s2 = np.zeros([setup.nexp, setup.ntemps], dtype=int)
+    count_decor = np.zeros([setup.p, setup.ntemps], dtype=int)
+
+    pred_cand = [_.copy() for _ in pred_curr]
+    discrep_curr = [_ * 0.0 for _ in pred_curr]
+    discrep_vars = [
+        np.zeros([setup.nmcmc, setup.ntemps, setup.models[i].nd])
+        for i in range(setup.nexp)
+    ]
+    yobs_cand = [None] * setup.nexp
+    bin_cand = [None] * setup.nexp
+
+    llik_cand = llik_curr.copy()
+
+    alpha = np.ones(setup.ntemps) * (-np.inf)
+    alpha_s2 = np.ones([setup.nexp, setup.ntemps]) * (-np.inf)
+    sw_alpha = np.zeros(setup.nswap_per)
+
+    llik = np.empty(setup.nmcmc)
+
+    for m in pbar(range(1, setup.nmcmc)):
+        theta[m] = theta[m - 1].copy()
+
+        # Update current emulator state, discrepancy, and likelihood for each model
+        for i in range(setup.nexp):
+            log_s2[i][m] = log_s2[i][m - 1].copy()
+
+            if setup.models[i].nd > 0:
+                for t in range(setup.ntemps):
+                    discrep_vars[i][m][t] = setup.models[i].discrep_sample(
+                        yobs_curr[i][t],
+                        pred_curr[i][t],
+                        marg_lik_cov_curr[i][t],
+                        setup.itl[t],
+                    )
+                    discrep_curr[i][t] = (
+                        setup.models[i].D @ discrep_vars[i][m][t]
+                    )
+
+            setup.models[i].step()
+
+            if setup.models[i].stochastic:
+                pred_curr[i] = setup.models[i].eval(
+                    tran_unif(theta[m], setup.bounds_mat, setup.bounds.keys()),
+                    pool=True,
+                )
+                current_bins = np.asarray(
+                    setup.models[i].last_bin_tuples_pool, dtype=object
+                )
+                bin_curr[i] = current_bins.copy()
+
+                for t in range(setup.ntemps):
+                    binKey_t = bin_curr[i][t]
+                    yobs_curr[i][t] = setup.models[i].get_yobs_for_bin(binKey_t)
+                    s2vec_t = np.exp(log_s2[i][m][t])[setup.s2_ind[i]]
+                    marg_lik_cov_curr[i][t] = setup.models[i].lik_cov_inv_for_bin(
+                        s2vec_t, binKey_t
+                    )
+
+            if setup.models[i].nd > 0 or setup.models[i].stochastic:
+                for t in range(setup.ntemps):
+                    llik_curr[i, t] = setup.models[i].llik(
+                        yobs_curr[i][t] - discrep_curr[i][t],
+                        pred_curr[i][t],
+                        marg_lik_cov_curr[i][t],
+                    )
+
+        cov_theta_cand.update(theta, m)
+
+        theta_cand = cov_theta_cand.gen_cand(theta, m)
+        good_values = setup.checkConstraints(
+            tran_unif(theta_cand, setup.bounds_mat, setup.bounds.keys())
+        )
+
+        pred_cand = [_.copy() for _ in pred_curr]
+        yobs_cand = [[y.copy() for y in yobs_curr[i]] for i in range(setup.nexp)]
+        bin_cand = [list(bin_curr[i]) for i in range(setup.nexp)]
+        marg_lik_cov_cand_all = [
+            [cov.copy() if isinstance(cov, dict) else cov for cov in marg_lik_cov_curr[i]]
+            for i in range(setup.nexp)
+        ]
+        llik_cand[:] = llik_curr.copy()
+
+        if np.any(good_values):
+            good_temps = np.where(good_values)[0]
+
+            for i in range(setup.nexp):
+                pred_good = setup.models[i].eval(
+                    tran_unif(
+                        theta_cand[good_values],
+                        setup.bounds_mat,
+                        setup.bounds.keys(),
+                    ),
+                    pool=True,
+                )
+                pred_cand[i][good_values] = pred_good
+                cand_bins = np.asarray(
+                    setup.models[i].last_bin_tuples_pool, dtype=object
+                )
+
+                for local_idx, t in enumerate(good_temps):
+                    binKey_t = cand_bins[local_idx]
+                    bin_cand[i][t] = binKey_t
+                    yobs_cand[i][t] = setup.models[i].get_yobs_for_bin(binKey_t)
+                    s2vec_t = np.exp(log_s2[i][m][t])[setup.s2_ind[i]]
+                    marg_lik_cov_cand_all[i][t] = setup.models[i].lik_cov_inv_for_bin(
+                        s2vec_t, binKey_t
+                    )
+
+                for t in range(setup.ntemps):
+                    llik_cand[i, t] = setup.models[i].llik(
+                        yobs_cand[i][t] - discrep_curr[i][t],
+                        pred_cand[i][t],
+                        marg_lik_cov_cand_all[i][t],
+                    )
+
+        llik_diff = (llik_cand.sum(axis=0) - llik_curr.sum(axis=0))[good_values]
+
+        alpha[:] = -np.inf
+        alpha[good_values] = setup.itl[good_values] * llik_diff
+
+        for t in np.where(np.log(uniform(size=setup.ntemps)) < alpha)[0]:
+            theta[m, t] = theta_cand[t].copy()
+            count[t, t] += 1
+
+            for i in range(setup.nexp):
+                llik_curr[i, t] = llik_cand[i, t].copy()
+                pred_curr[i][t] = pred_cand[i][t].copy()
+                yobs_curr[i][t] = yobs_cand[i][t].copy()
+                bin_curr[i][t] = bin_cand[i][t]
+                marg_lik_cov_curr[i][t] = marg_lik_cov_cand_all[i][t]
+
+            cov_theta_cand.count_100[t] += 1
+
+        cov_theta_cand.update_tau(m)
+
+        if m % setup.decor == 0:
+            for k in range(setup.p):
+                theta_cand = theta[m].copy()
+                theta_cand[:, k] = initfunc_unif(size=setup.ntemps)
+                good_values = setup.checkConstraints(
+                    tran_unif(theta_cand, setup.bounds_mat, setup.bounds.keys())
+                )
+
+                pred_cand = [_.copy() for _ in pred_curr]
+                yobs_cand = [[y.copy() for y in yobs_curr[i]] for i in range(setup.nexp)]
+                bin_cand = [list(bin_curr[i]) for i in range(setup.nexp)]
+                marg_lik_cov_cand_all = [
+                    [cov.copy() if isinstance(cov, dict) else cov for cov in marg_lik_cov_curr[i]]
+                    for i in range(setup.nexp)
+                ]
+                llik_cand[:] = llik_curr.copy()
+
+                if np.any(good_values):
+                    good_temps = np.where(good_values)[0]
+
+                    for i in range(setup.nexp):
+                        pred_good = setup.models[i].eval(
+                            tran_unif(
+                                theta_cand[good_values],
+                                setup.bounds_mat,
+                                setup.bounds.keys(),
+                            ),
+                            pool=True,
+                        )
+                        pred_cand[i][good_values] = pred_good
+                        cand_bins = np.asarray(
+                            setup.models[i].last_bin_tuples_pool, dtype=object
+                        )
+
+                        for local_idx, t in enumerate(good_temps):
+                            binKey_t = cand_bins[local_idx]
+                            bin_cand[i][t] = binKey_t
+                            yobs_cand[i][t] = setup.models[i].get_yobs_for_bin(binKey_t)
+                            s2vec_t = np.exp(log_s2[i][m][t])[setup.s2_ind[i]]
+                            marg_lik_cov_cand_all[i][t] = setup.models[i].lik_cov_inv_for_bin(
+                                s2vec_t, binKey_t
+                            )
+
+                        for t in range(setup.ntemps):
+                            llik_cand[i, t] = setup.models[i].llik(
+                                yobs_cand[i][t] - discrep_curr[i][t],
+                                pred_cand[i][t],
+                                marg_lik_cov_cand_all[i][t],
+                            )
+
+                alpha[:] = -np.inf
+                llik_diff = (llik_cand.sum(axis=0) - llik_curr.sum(axis=0))[good_values]
+                alpha[good_values] = setup.itl[good_values] * llik_diff
+
+                for t in np.where(np.log(uniform(size=setup.ntemps)) < alpha)[0]:
+                    theta[m, t, k] = theta_cand[t, k].copy()
+                    count_decor[k, t] += 1
+
+                    for i in range(setup.nexp):
+                        pred_curr[i][t] = pred_cand[i][t].copy()
+                        yobs_curr[i][t] = yobs_cand[i][t].copy()
+                        bin_curr[i][t] = bin_cand[i][t]
+                        llik_curr[i, t] = llik_cand[i, t].copy()
+                        marg_lik_cov_curr[i][t] = marg_lik_cov_cand_all[i][t]
+
+        # Update s2 independently for each model
+        for i in range(setup.nexp):
+            if setup.models[i].s2 == "gibbs":
+                dev_sq = np.zeros((setup.ntemps, setup.ns2[i]))
+                for t in range(setup.ntemps):
+                    resid_t = pred_curr[i][t] - yobs_curr[i][t]
+                    dev_sq[t] = resid_t**2 @ s2_ind_mat[i]
+
+                log_s2[i][m] = np.log(
+                    1
+                    / np.random.gamma(
+                        itl_mat[i] * (setup.ny_s2[i] / 2 + setup.ig_a[i] + 1) - 1,
+                        1 / (itl_mat[i] * (setup.ig_b[i] + dev_sq / 2)),
+                    )
+                )
+
+                for t in range(setup.ntemps):
+                    binKey_t = bin_curr[i][t]
+                    s2vec_t = np.exp(log_s2[i][m][t])[setup.s2_ind[i]]
+                    marg_lik_cov_curr[i][t] = setup.models[i].lik_cov_inv_for_bin(
+                        s2vec_t, binKey_t
+                    )
+                    llik_curr[i, t] = setup.models[i].llik(
+                        yobs_curr[i][t] - discrep_curr[i][t],
+                        pred_curr[i][t],
+                        marg_lik_cov_curr[i][t],
+                    )
+
+            elif setup.models[i].s2 == "fix":
+                log_s2[i][m] = np.log(setup.sd_est[i] ** 2)
+
+            else:
+                cov_ls2_cand[i].update(log_s2[i], m)
+                ls2_candi = cov_ls2_cand[i].gen_cand(log_s2[i], m)
+
+                llik_candi = np.zeros(setup.ntemps)
+                marg_lik_cov_candi = [None] * setup.ntemps
+                for t in range(setup.ntemps):
+                    binKey_t = bin_curr[i][t]
+                    s2vec_t = np.exp(ls2_candi[t])[setup.s2_ind[i]]
+                    marg_lik_cov_candi[t] = setup.models[i].lik_cov_inv_for_bin(
+                        s2vec_t, binKey_t
+                    )
+                    llik_candi[t] = setup.models[i].llik(
+                        yobs_curr[i][t] - discrep_curr[i][t],
+                        pred_curr[i][t],
+                        marg_lik_cov_candi[t],
+                    )
+
+                llik_diffi = llik_candi - llik_curr[i]
+                alpha_s2 = setup.itl * llik_diffi
+                alpha_s2 += (
+                    setup.itl
+                    * setup.s2_prior_kern[i](
+                        np.exp(ls2_candi), setup.ig_a[i], setup.ig_b[i]
+                    ).sum(axis=1)
+                )
+                alpha_s2 += setup.itl * ls2_candi.sum(axis=1)
+                alpha_s2 -= (
+                    setup.itl
+                    * setup.s2_prior_kern[i](
+                        np.exp(log_s2[i][m - 1]), setup.ig_a[i], setup.ig_b[i]
+                    ).sum(axis=1)
+                )
+                alpha_s2 -= setup.itl * log_s2[i][m - 1].sum(axis=1)
+
+                runif = np.log(uniform(size=setup.ntemps))
+                for t in np.where(runif < alpha_s2)[0]:
+                    count_s2[i, t] += 1
+                    llik_curr[i, t] = llik_candi[t].copy()
+                    log_s2[i][m][t] = ls2_candi[t].copy()
+                    marg_lik_cov_curr[i][t] = marg_lik_cov_candi[t].copy()
+                    cov_ls2_cand[i].count_100[t] += 1
+
+                cov_ls2_cand[i].update_tau(m)
+
+        if m > setup.start_temper and setup.ntemps > 1:
+            for _ in range(setup.nswap):
+                sw = np.random.choice(
+                    setup.ntemps, 2 * setup.nswap_per, replace=False
+                ).reshape(-1, 2)
+                sw_alpha[:] = 0.0
+
+                sw_alpha += (setup.itl[sw.T[1]] - setup.itl[sw.T[0]]) * (
+                    llik_curr[:, sw.T[0]].sum(axis=0)
+                    - llik_curr[:, sw.T[1]].sum(axis=0)
+                )
+
+                for i in range(setup.nexp):
+                    sw_alpha += (setup.itl[sw.T[1]] - setup.itl[sw.T[0]]) * (
+                        setup.s2_prior_kern[i](
+                            np.exp(log_s2[i][m][sw.T[0]]),
+                            setup.ig_a[i],
+                            setup.ig_b[i],
+                        ).sum(axis=1)
+                        - setup.s2_prior_kern[i](
+                            np.exp(log_s2[i][m][sw.T[1]]),
+                            setup.ig_a[i],
+                            setup.ig_b[i],
+                        ).sum(axis=1)
+                    )
+
+                    if setup.models[i].nd > 0:
+                        sw_alpha += (
+                            setup.itl[sw.T[1]] - setup.itl[sw.T[0]]
+                        ) * (
+                            -0.5
+                            * (discrep_vars[i][m][sw.T[0]] ** 2).sum(axis=1)
+                            / setup.models[i].discrep_tau
+                            + 0.5
+                            * (discrep_vars[i][m][sw.T[1]] ** 2).sum(axis=1)
+                            / setup.models[i].discrep_tau
+                        )
+
+                for tt in sw[
+                    np.where(np.log(uniform(size=setup.nswap_per)) < sw_alpha)[0]
+                ]:
+                    for i in range(setup.nexp):
+                        log_s2[i][m][tt[0]], log_s2[i][m][tt[1]] = (
+                            log_s2[i][m][tt[1]].copy(),
+                            log_s2[i][m][tt[0]].copy(),
+                        )
+                        (
+                            marg_lik_cov_curr[i][tt[0]],
+                            marg_lik_cov_curr[i][tt[1]],
+                        ) = (
+                            marg_lik_cov_curr[i][tt[1]].copy(),
+                            marg_lik_cov_curr[i][tt[0]].copy(),
+                        )
+                        pred_curr[i][tt[0]], pred_curr[i][tt[1]] = (
+                            pred_curr[i][tt[1]].copy(),
+                            pred_curr[i][tt[0]].copy(),
+                        )
+                        yobs_curr[i][tt[0]], yobs_curr[i][tt[1]] = (
+                            yobs_curr[i][tt[1]].copy(),
+                            yobs_curr[i][tt[0]].copy(),
+                        )
+                        bin_curr[i][tt[0]], bin_curr[i][tt[1]] = (
+                            bin_curr[i][tt[1]],
+                            bin_curr[i][tt[0]],
+                        )
+                        discrep_curr[i][tt[0]], discrep_curr[i][tt[1]] = (
+                            discrep_curr[i][tt[1]].copy(),
+                            discrep_curr[i][tt[0]].copy(),
+                        )
+                        discrep_vars[i][m][tt[0]], discrep_vars[i][m][tt[1]] = (
+                            discrep_vars[i][m][tt[1]].copy(),
+                            discrep_vars[i][m][tt[0]].copy(),
+                        )
+                        llik_curr[i, tt[0]], llik_curr[i, tt[1]] = (
+                            llik_curr[i, tt[1]].copy(),
+                            llik_curr[i, tt[0]].copy(),
+                        )
+
+                    count[tt[0], tt[1]] += 1
+                    theta[m][tt[0]], theta[m][tt[1]] = (
+                        theta[m][tt[1]].copy(),
+                        theta[m][tt[0]].copy(),
+                    )
+
+        llik[m] = llik_curr[:, 0].sum()
+
+    s2 = log_s2.copy()
+    for i in range(setup.nexp):
+        s2[i] = np.exp(log_s2[i])
+
+    theta_native = tran_unif(theta[:, 0], setup.bounds_mat, setup.bounds.keys())
+
+    t1 = time.time()
+    print(f"\rCalibration MCMC Complete. Time: {t1 - t0:f} seconds.")
+    count = count + count.T - np.diag(np.diag(count))
+
+    out = OutCalibPool(
+        theta,
+        s2,
+        count,
+        count_s2,
+        count_decor,
+        cov_theta_cand,
+        cov_ls2_cand,
+        pred_curr,
+        discrep_vars,
+        llik,
+        theta_native,
+    )
+    return out
+    
+
 ##############################################################################################################################################################################
 
 
